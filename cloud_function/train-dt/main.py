@@ -1,164 +1,259 @@
-# Decision Tree: train on all data < today (local TZ); hold out today
-# HTTP entrypoint: train_dt_http
+# train-dt/main.py
+# Champion vs Challenger price prediction.
+#
+# Champions: pre-trained models loaded from GCS (never retrained automatically)
+#   - champion_regex : trained on 4,185 regex-extracted listings (Nov 2025-May 2026)
+#   - champion_llm   : trained on 867 LLM-extracted listings (Dec 2025-Apr 2026)
+#
+# Challengers: retrained fresh each run on the latest master CSVs
+#   - challenger_regex : listings_master.csv       (regex fields)
+#   - challenger_llm   : listings_master_llm_v1.csv (LLM fields)
+#
+# All four models score today's holdout. Results written to GCS as:
+#   structured/preds/<YYYYMMDDHH>/preds.csv          (champion_regex predictions)
+#   structured/preds/<YYYYMMDDHH>/comparison.csv     (all 4 models side by side)
 
-import os, io, json, logging, traceback, re
+import io
+import json
+import logging
+import os
+import traceback
+from datetime import datetime, timezone
+
+import joblib
 import numpy as np
 import pandas as pd
 from google.cloud import storage
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import mean_absolute_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.tree import DecisionTreeRegressor
 
-# ---- ENV ----
-PROJECT_ID     = os.getenv("PROJECT_ID", "")
-GCS_BUCKET     = os.getenv("GCS_BUCKET", "")
-DATA_KEY       = os.getenv("DATA_KEY", "structured/datasets/listings_master_llm_v1.csv")
-OUTPUT_PREFIX  = os.getenv("OUTPUT_PREFIX", "preds")            # e.g., "structured/preds"
-TIMEZONE       = os.getenv("TIMEZONE", "America/New_York")      # split by local day
-LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
+# ── env ───────────────────────────────────────────────────────────────────────
+PROJECT_ID        = os.getenv("PROJECT_ID", "")
+GCS_BUCKET        = os.getenv("GCS_BUCKET", "")
+STRUCTURED_PREFIX = os.getenv("STRUCTURED_PREFIX", "structured")
+OUTPUT_PREFIX     = os.getenv("OUTPUT_PREFIX", "structured/preds")
+TIMEZONE          = os.getenv("TIMEZONE", "America/New_York")
+LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 
-def _read_csv_from_gcs(client: storage.Client, bucket: str, key: str) -> pd.DataFrame:
+# ── GCS paths ─────────────────────────────────────────────────────────────────
+REGEX_MASTER_KEY   = f"{STRUCTURED_PREFIX}/datasets/listings_master.csv"
+LLM_MASTER_KEY     = f"{STRUCTURED_PREFIX}/datasets/listings_master_llm_v1.csv"
+CHAMPION_REGEX_KEY = "models/champion_regex.pkl"
+CHAMPION_LLM_KEY   = "models/champion_llm.pkl"
+
+# ── feature sets ──────────────────────────────────────────────────────────────
+REGEX_CAT = ["make", "model", "transmission", "color", "fuel", "vehicle_type"]
+LLM_CAT   = ["make", "model", "transmission", "color"]
+NUM_COLS  = ["year_n", "mileage_n"]
+TARGET    = "price_n"
+
+MAX_DEPTH        = 12
+MIN_SAMPLES_LEAF = 10
+RANDOM_STATE     = 42
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _read_csv(client, bucket, key):
     b = client.bucket(bucket)
     blob = b.blob(key)
     if not blob.exists():
-        raise FileNotFoundError(f"gs://{bucket}/{key} not found")
+        return None
     return pd.read_csv(io.BytesIO(blob.download_as_bytes()))
 
-def _write_csv_to_gcs(client: storage.Client, bucket: str, key: str, df: pd.DataFrame):
-    b = client.bucket(bucket)
-    blob = b.blob(key)
-    blob.upload_from_string(df.to_csv(index=False), content_type="text/csv")
 
-def _clean_numeric(s: pd.Series) -> pd.Series:
-    # Strip $, commas, spaces; keep digits and dot
-    s = s.astype(str).str.replace(r"[^\d.]+", "", regex=True).str.strip()
-    return pd.to_numeric(s, errors="coerce")
+def _write_csv(client, bucket, key, df):
+    client.bucket(bucket).blob(key).upload_from_string(
+        df.to_csv(index=False), content_type="text/csv")
 
-def run_once(dry_run: bool = False, max_depth: int = 12, min_samples_leaf: int = 10):
-    client = storage.Client(project=PROJECT_ID)
-    df = _read_csv_from_gcs(client, GCS_BUCKET, DATA_KEY)
 
-    required = {"scraped_at", "price", "make", "model", "year", "mileage"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {sorted(missing)}")
+def _load_model(client, bucket, key):
+    blob = client.bucket(bucket).blob(key)
+    if not blob.exists():
+        return None
+    return joblib.load(io.BytesIO(blob.download_as_bytes()))
 
-    # --- Parse timestamps and choose local-day split ---
-    dt = pd.to_datetime(df["scraped_at"], errors="coerce", utc=True)
-    df["scraped_at_dt_utc"] = dt
+
+def _clean(df, cat_cols):
+    df = df.copy()
+    df["price_n"] = pd.to_numeric(
+        df["price"].astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce")
+    df["year_n"] = pd.to_numeric(df.get("year"), errors="coerce")
+    df["mileage_n"] = pd.to_numeric(
+        df.get("mileage", pd.Series(dtype=float)).astype(str).str.replace(r"[^\d.]", "", regex=True),
+        errors="coerce")
+    for c in cat_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[df[TARGET].between(500, 150_000)].copy()
+
+
+def _date_split(df, timezone_str):
+    dt = pd.to_datetime(df.get("scraped_at", pd.Series(dtype=str)), errors="coerce", utc=True)
+    df["_dt_utc"] = dt
     try:
-        df["scraped_at_local"] = df["scraped_at_dt_utc"].dt.tz_convert(TIMEZONE)
+        df["_date_local"] = df["_dt_utc"].dt.tz_convert(timezone_str).dt.date
     except Exception:
-        df["scraped_at_local"] = df["scraped_at_dt_utc"]
-    df["date_local"] = df["scraped_at_local"].dt.date
-
-    # --- Clean numerics BEFORE counting/dropping ---
-    orig_rows = len(df)
-    df["price_num"]   = _clean_numeric(df["price"])
-    df["year_num"]    = _clean_numeric(df["year"])
-    df["mileage_num"] = _clean_numeric(df["mileage"])
-
-    valid_price_rows = int(df["price_num"].notna().sum())
-    logging.info("Rows total=%d | with valid numeric price=%d", orig_rows, valid_price_rows)
-
-    counts = df["date_local"].value_counts().sort_index()
-    logging.info("Recent date counts (local): %s", json.dumps({str(k): int(v) for k, v in counts.tail(8).items()}))
-
-    unique_dates = sorted(d for d in df["date_local"].dropna().unique())
+        df["_date_local"] = df["_dt_utc"].dt.date
+    unique_dates = sorted(df["_date_local"].dropna().unique())
     if len(unique_dates) < 2:
-        return {"status": "noop", "reason": "need at least two distinct dates", "dates": [str(d) for d in unique_dates]}
+        return None, None, None
+    today = unique_dates[-1]
+    return (df[df["_date_local"] < today].copy(),
+            df[df["_date_local"] == today].copy(),
+            str(today))
 
-    today_local = unique_dates[-1]
-    train_df   = df[df["date_local"] <  today_local].copy()
-    holdout_df = df[df["date_local"] == today_local].copy()
 
-    train_df = train_df[train_df["price_num"].notna()]
-    dropped_for_target = int((df["date_local"] < today_local).sum()) - int(len(train_df))
-    logging.info("Train rows after target clean: %d (dropped_for_target=%d)", len(train_df), dropped_for_target)
-    logging.info("Holdout rows today (%s): %d", today_local, len(holdout_df))
+def _build_pipeline(cat_cols):
+    pre = ColumnTransformer(transformers=[
+        ("num", SimpleImputer(strategy="median"), NUM_COLS),
+        ("cat", Pipeline([
+            ("imp", SimpleImputer(strategy="most_frequent")),
+            ("oh",  OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]), cat_cols),
+    ], remainder="drop")
+    return Pipeline([("pre", pre), ("model", DecisionTreeRegressor(
+        max_depth=MAX_DEPTH, min_samples_leaf=MIN_SAMPLES_LEAF, random_state=RANDOM_STATE))])
 
-    if len(train_df) < 40:
-        return {"status": "noop", "reason": "too few training rows", "train_rows": int(len(train_df))}
 
-    # --- Model: make, model, year_num, mileage_num -> price_num ---
-    target = "price_num"
-    cat_cols = ["make", "model", "transmission", "color"]
-    num_cols = ["year_num", "mileage_num"]
-    feats = cat_cols + num_cols
+def _score(pipe, holdout, cat_cols, name):
+    if pipe is None or holdout is None or holdout.empty:
+        return None, None
+    feats = cat_cols + NUM_COLS
+    for c in feats:
+        if c not in holdout.columns:
+            holdout[c] = np.nan
+    try:
+        y_hat = pipe.predict(holdout[feats])
+        mae = None
+        if holdout[TARGET].notna().any():
+            mask = holdout[TARGET].notna()
+            mae = float(mean_absolute_error(holdout[TARGET][mask], y_hat[mask]))
+        return np.round(y_hat, 2), mae
+    except Exception as e:
+        logging.warning("Scoring failed for %s: %s", name, e)
+        return None, None
 
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", SimpleImputer(strategy="median"), num_cols),
-            ("cat", Pipeline([
-                ("imp", SimpleImputer(strategy="most_frequent")),
-                ("oh", OneHotEncoder(handle_unknown="ignore"))
-            ]), cat_cols),
-        ]
-    )
 
-    model = DecisionTreeRegressor(max_depth=max_depth, min_samples_leaf=min_samples_leaf, random_state=42)
-    pipe = Pipeline([("pre", pre), ("model", model)])
-
-    X_train = train_df[feats]
-    y_train = train_df[target]
-    pipe.fit(X_train, y_train)
-
-    # ---- Predict/evaluate on today's holdout (now includes actual price fields) ----
-    mae_today = None
-    preds_df = pd.DataFrame()
-    if not holdout_df.empty:
-        X_h = holdout_df[feats]
-        y_hat = pipe.predict(X_h)
-
-        cols = ["post_id", "scraped_at", "make", "model", "year", "mileage", "price"]
-        preds_df = holdout_df[cols].copy()
-        preds_df["actual_price"] = holdout_df["price_num"]       # cleaned numeric truth
-        preds_df["pred_price"]   = np.round(y_hat, 2)
-
-        if holdout_df["price_num"].notna().any():
-            y_true = holdout_df["price_num"]
-            mask = y_true.notna()
-            if mask.any():
-                mae_today = float(mean_absolute_error(y_true[mask], y_hat[mask]))
-
-    # --- Output path: HOURLY folder structure ---
-    now_utc = pd.Timestamp.utcnow().tz_convert("UTC")
-    out_key = f"{OUTPUT_PREFIX}/{now_utc.strftime('%Y%m%d%H')}/preds.csv"
-
-    if not dry_run and len(preds_df) > 0:
-        _write_csv_to_gcs(client, GCS_BUCKET, out_key, preds_df)
-        logging.info("Wrote predictions to gs://%s/%s (%d rows)", GCS_BUCKET, out_key, len(preds_df))
-    else:
-        logging.info("Dry run or no holdout rows; skip write. Would write to gs://%s/%s", GCS_BUCKET, out_key)
-
-    return {
-        "status": "ok",
-        "today_local": str(today_local),
-        "train_rows": int(len(train_df)),
-        "holdout_rows": int(len(holdout_df)),
-        "valid_price_rows": valid_price_rows,
-        "mae_today": mae_today,
-        "output_key": out_key,
-        "dry_run": dry_run,
-        "timezone": TIMEZONE,
-    }
+# ── entrypoint ────────────────────────────────────────────────────────────────
 
 def train_dt_http(request):
     try:
-        body = request.get_json(silent=True) or {}
-        result = run_once(
-            dry_run=bool(body.get("dry_run", False)),
-            max_depth=int(body.get("max_depth", 12)),
-            min_samples_leaf=int(body.get("min_samples_leaf", 10)),
-        )
-        code = 200 if result.get("status") == "ok" else 204
-        return (json.dumps(result), code, {"Content-Type": "application/json"})
+        body    = request.get_json(silent=True) or {}
+        dry_run = bool(body.get("dry_run", False))
+
+        if not GCS_BUCKET:
+            return _resp({"ok": False, "error": "missing GCS_BUCKET env"}, 500)
+
+        client  = storage.Client(project=PROJECT_ID)
+        now_utc = datetime.now(timezone.utc)
+        out_folder = f"{OUTPUT_PREFIX}/{now_utc.strftime('%Y%m%d%H')}"
+
+        result = {
+            "ok": True,
+            "run_at": now_utc.isoformat(),
+            "dry_run": dry_run,
+            "models": {}
+        }
+
+        # load champions
+        logging.info("Loading champions from GCS...")
+        champ_regex = _load_model(client, GCS_BUCKET, CHAMPION_REGEX_KEY)
+        champ_llm   = _load_model(client, GCS_BUCKET, CHAMPION_LLM_KEY)
+        result["champion_regex_loaded"] = champ_regex is not None
+        result["champion_llm_loaded"]   = champ_llm is not None
+
+        comparison_rows = []
+
+        for label, master_key, cat_cols, champ in [
+            ("regex", REGEX_MASTER_KEY, REGEX_CAT, champ_regex),
+            ("llm",   LLM_MASTER_KEY,   LLM_CAT,   champ_llm),
+        ]:
+            df_raw = _read_csv(client, GCS_BUCKET, master_key)
+            if df_raw is None:
+                result["models"][label] = {"status": "no_data"}
+                continue
+
+            df = _clean(df_raw, cat_cols)
+            train, holdout, today_str = _date_split(df, TIMEZONE)
+            m = {"today": today_str}
+
+            if train is None or len(train) < 40:
+                m["status"] = "too_few_rows"
+                result["models"][label] = m
+                continue
+
+            # train challenger
+            challenger = _build_pipeline(cat_cols)
+            challenger.fit(train[cat_cols + NUM_COLS], train[TARGET])
+            train_mae = float(mean_absolute_error(
+                train[TARGET], challenger.predict(train[cat_cols + NUM_COLS])))
+
+            m["challenger_train_rows"] = int(len(train))
+            m["challenger_train_mae"]  = round(train_mae, 2)
+            m["holdout_rows"]          = int(len(holdout)) if holdout is not None else 0
+
+            # score all models on holdout
+            champ_preds, champ_mae = _score(champ,      holdout.copy(), cat_cols, f"champion_{label}")
+            chal_preds,  chal_mae  = _score(challenger,  holdout.copy(), cat_cols, f"challenger_{label}")
+
+            m["champion_mae"]   = round(champ_mae, 2) if champ_mae is not None else None
+            m["challenger_mae"] = round(chal_mae,  2) if chal_mae  is not None else None
+            m["status"] = "ok"
+
+            if champ_mae and chal_mae:
+                diff = champ_mae - chal_mae
+                m["winner"] = "challenger" if diff > 0 else "champion"
+                m["challenger_beats_champion_by"] = round(diff, 2)
+                logging.info("%s: champion MAE=$%,.0f  challenger MAE=$%,.0f  winner=%s",
+                             label, champ_mae, chal_mae, m["winner"])
+
+            result["models"][label] = m
+
+            # build comparison rows for CSV
+            if holdout is not None and not holdout.empty:
+                base = [c for c in ["post_id","scraped_at","make","model","year","mileage","price"]
+                        if c in holdout.columns]
+                rows = holdout[base].copy()
+                rows["actual_price"] = holdout[TARGET]
+                if champ_preds is not None:
+                    rows[f"pred_champion_{label}"]  = champ_preds
+                if chal_preds is not None:
+                    rows[f"pred_challenger_{label}"] = chal_preds
+                comparison_rows.append(rows)
+
+        # write outputs
+        if not dry_run and comparison_rows:
+            # merge all comparison frames on shared base columns
+            combined = comparison_rows[0]
+            for extra in comparison_rows[1:]:
+                shared = [c for c in combined.columns if c in extra.columns
+                          and not c.startswith("pred_")]
+                combined = pd.merge(combined, extra, on=shared, how="outer")
+
+            comp_key = f"{out_folder}/comparison.csv"
+            _write_csv(client, GCS_BUCKET, comp_key, combined)
+            result["comparison_csv"] = f"gs://{GCS_BUCKET}/{comp_key}"
+
+            # backwards-compat preds.csv (champion_regex)
+            regex_rows = [r for r in comparison_rows if "pred_champion_regex" in r.columns]
+            if regex_rows:
+                preds_key = f"{out_folder}/preds.csv"
+                _write_csv(client, GCS_BUCKET, preds_key, regex_rows[0])
+                result["preds_csv"] = f"gs://{GCS_BUCKET}/{preds_key}"
+
+        return _resp(result, 200)
+
     except Exception as e:
-        logging.error("Error: %s", e)
-        logging.error("Trace:\n%s", traceback.format_exc())
-        return (json.dumps({"status": "error", "error": str(e)}), 500, {"Content-Type": "application/json"})
+        logging.error("Error: %s\n%s", e, traceback.format_exc())
+        return _resp({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+
+def _resp(body, code):
+    return (json.dumps(body, default=str), code, {"Content-Type": "application/json"})
