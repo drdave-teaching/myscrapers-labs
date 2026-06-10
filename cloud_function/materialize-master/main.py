@@ -1,14 +1,15 @@
 # main.py
-# Build a single, ever-growing CSV from all structured JSONL files.
-# Reads:  gs://<bucket>/<STRUCTURED_PREFIX>/run_id=*/jsonl/*.jsonl
-# Writes: gs://<bucket>/<STRUCTURED_PREFIX>/datasets/listings_master.csv  (atomic publish)
+# Incrementally append new listings to listings_master.csv.
+# Reads:  gs://<bucket>/<STRUCTURED_PREFIX>/run_id=*/jsonl/*.jsonl  (recent runs only)
+# Merges: existing listings_master.csv (loads post_ids already seen)
+# Writes: gs://<bucket>/<STRUCTURED_PREFIX>/datasets/listings_master.csv
 
 import csv
 import io
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Iterable
 
 from flask import Request, jsonify
@@ -33,11 +34,11 @@ CSV_COLUMNS = [
 
 def _list_run_ids(bucket: str, structured_prefix: str) -> list[str]:
     it = storage_client.list_blobs(bucket, prefix=f"{structured_prefix}/", delimiter="/")
-    for _ in it:  # populate it.prefixes
+    for _ in it:
         pass
     run_ids = []
     for p in getattr(it, "prefixes", []):
-        tail = p.rstrip("/").split("/")[-1]           # e.g. run_id=20251026170002
+        tail = p.rstrip("/").split("/")[-1]
         if tail.startswith("run_id="):
             rid = tail.split("run_id=", 1)[1]
             if RUN_ID_ISO_RE.match(rid) or RUN_ID_PLAIN_RE.match(rid):
@@ -45,7 +46,7 @@ def _list_run_ids(bucket: str, structured_prefix: str) -> list[str]:
     return sorted(run_ids)
 
 def _jsonl_records_for_run(bucket: str, structured_prefix: str, run_id: str):
-    """Yield dict records from .jsonl under .../run_id=<run_id>/jsonl/ (one JSON per file)."""
+    """Yield dict records from .jsonl under .../run_id=<run_id>/jsonl/"""
     b = storage_client.bucket(bucket)
     prefix = f"{structured_prefix}/run_id={run_id}/jsonl/"
     for blob in b.list_blobs(prefix=prefix):
@@ -57,7 +58,6 @@ def _jsonl_records_for_run(bucket: str, structured_prefix: str, run_id: str):
             continue
         try:
             rec = json.loads(line)
-            # ensure required keys exist
             rec.setdefault("run_id", run_id)
             yield rec
         except Exception:
@@ -68,16 +68,12 @@ def _run_id_to_dt(rid: str) -> datetime:
         return datetime.strptime(rid, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
     if RUN_ID_PLAIN_RE.match(rid):
         return datetime.strptime(rid, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-    # fallback: now
     return datetime.now(timezone.utc)
 
 def _open_gcs_text_writer(bucket: str, key: str):
-    """Open a text-mode writer to GCS; close() will finalize the upload."""
     b = storage_client.bucket(bucket)
     blob = b.blob(key)
-    # Text mode avoids the flush/finalize pitfall of binary+TextIOWrapper
-    return blob.open("w")  # newline handled by csv module
-
+    return blob.open("w")
 
 def _write_csv(records: Iterable[Dict], dest_key: str, columns=CSV_COLUMNS) -> int:
     n = 0
@@ -88,44 +84,70 @@ def _write_csv(records: Iterable[Dict], dest_key: str, columns=CSV_COLUMNS) -> i
             row = {c: rec.get(c, None) for c in columns}
             w.writerow(row)
             n += 1
-    return n  # close() finalizes the upload
+    return n
+
+def _get_existing_master(bucket_name: str, key: str) -> Dict[str, Dict]:
+    """Load existing master CSV into a dict keyed by post_id. Returns {} if file doesn't exist yet."""
+    b = storage_client.bucket(bucket_name)
+    blob = b.blob(key)
+    data = {}
+    if not blob.exists():
+        return data
+    try:
+        content = blob.download_as_text()
+        reader = csv.DictReader(io.StringIO(content))
+        for row in reader:
+            pid = row.get("post_id")
+            if pid:
+                data[pid] = row
+    except Exception:
+        pass
+    return data
 
 def materialize_http(request: Request):
     """
     HTTP POST (no body needed).
-    Crawls ALL structured run folders, de-dupes by post_id (keep newest run),
-    and writes one CSV directly to .../datasets/listings_master.csv.
-    Returns JSON with counts and output path.
+    Looks back 75 minutes for new runs, loads existing master CSV,
+    merges new records (de-duped by post_id, keep newest run_id),
+    and writes back to listings_master.csv -- never rescans old data.
     """
     try:
         if not BUCKET_NAME:
             return jsonify({"ok": False, "error": "missing GCS_BUCKET env"}), 500
 
-        run_ids = _list_run_ids(BUCKET_NAME, STRUCTURED_PREFIX)
-        if not run_ids:
-            return jsonify({"ok": False, "error": f"no runs found under {STRUCTURED_PREFIX}/"}), 200
+        # Only scan runs from the last 75 minutes (catches previous hour's run)
+        all_run_ids = _list_run_ids(BUCKET_NAME, STRUCTURED_PREFIX)
+        limit_time  = datetime.now(timezone.utc) - timedelta(minutes=75)
+        recent_runs = [r for r in all_run_ids if _run_id_to_dt(r) > limit_time]
 
-        latest_by_post: Dict[str, Dict] = {}
-        for rid in run_ids:
+        if not recent_runs:
+            return jsonify({"ok": True, "message": "No new runs in the last 75 minutes"}), 200
+
+        final_key = f"{STRUCTURED_PREFIX}/datasets/listings_master.csv"
+
+        # Load what we already have so we don't reprocess old listings
+        master: Dict[str, Dict] = _get_existing_master(BUCKET_NAME, final_key)
+        existing_count = len(master)
+
+        # Merge in only new/updated records
+        for rid in recent_runs:
             for rec in _jsonl_records_for_run(BUCKET_NAME, STRUCTURED_PREFIX, rid):
                 pid = rec.get("post_id")
                 if not pid:
                     continue
-                prev = latest_by_post.get(pid)
-                if (prev is None) or (_run_id_to_dt(rec.get("run_id", rid)) > _run_id_to_dt(prev.get("run_id", ""))):
-                    latest_by_post[pid] = rec
+                prev = master.get(pid)
+                if (prev is None) or (_run_id_to_dt(rid) >= _run_id_to_dt(prev.get("run_id", ""))):
+                    master[pid] = rec
 
-        base = f"{STRUCTURED_PREFIX}/datasets"
-        final_key = f"{base}/listings_master.csv"
-        rows = _write_csv(latest_by_post.values(), final_key)
+        rows = _write_csv(master.values(), final_key)
 
         return jsonify({
             "ok": True,
-            "runs_scanned": len(run_ids),
-            "unique_listings": len(latest_by_post),
-            "rows_written": rows,
+            "recent_runs_scanned": len(recent_runs),
+            "existing_listings": existing_count,
+            "total_listings": rows,
+            "new_or_updated": rows - existing_count,
             "output_csv": f"gs://{BUCKET_NAME}/{final_key}"
         }), 200
     except Exception as e:
-        # Return a JSON error so you don't just see a plain 500
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
