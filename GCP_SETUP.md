@@ -22,24 +22,29 @@ You need:
 ## Step 1 -- Variables (run this first, fill in YOUR values)
 
 ```bash
-PROJECT_ID="your-gcp-project-id"        # e.g. craigslist-scraper-499015
-GITHUB_REPO="your-github-org/myscrapers-labs"  # e.g. drdww/myscrapers-labs
+PROJECT_ID="your-gcp-project-id"        # Dr. Wanik example: craigslist-scraper-499015
+GITHUB_REPO="your-github-org/myscrapers-labs"  # Dr. Wanik example: drdww/myscrapers-labs
 
 # --- auto-derived, do not edit below ---
-REGION="us-central1"
-BUCKET_NAME="${PROJECT_ID}-bucket"
+REGION="us-central1"                     # Dr. Wanik example: us-central1
+BUCKET_NAME="${PROJECT_ID}-bucket"       # Dr. Wanik example: craigslist-scraper-bucket
 RUNTIME_SA_ID="cf-runtime"
 DEPLOYER_SA_ID="cf-deployer"
 SCHED_SA_ID="cf-scheduler"
 WIF_POOL="gh-pool"
 WIF_PROVIDER="gh-provider"
 RUNTIME_SA="${RUNTIME_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+# Dr. Wanik example: cf-runtime@craigslist-scraper-499015.iam.gserviceaccount.com
 DEPLOYER_SA="${DEPLOYER_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+# Dr. Wanik example: cf-deployer@craigslist-scraper-499015.iam.gserviceaccount.com
 SCHED_SA="${SCHED_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+# Dr. Wanik example: cf-scheduler@craigslist-scraper-499015.iam.gserviceaccount.com
 PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
+# Dr. Wanik example: 598481111020
 PRINCIPAL_SET="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL}/attribute.repository/${GITHUB_REPO}"
 SCHEDULER_AGENT="service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
 echo "Ready. Project: ${PROJECT_ID} (${PROJECT_NUMBER})"
+# Dr. Wanik example: Ready. Project: craigslist-scraper-499015 (598481111020)
 ```
 
 ---
@@ -210,6 +215,7 @@ echo "BUCKET_NAME       = ${BUCKET_NAME}"
 echo "RUNTIME_SA        = ${RUNTIME_SA}"
 echo "DEPLOYER_SA       = ${DEPLOYER_SA}"
 echo "WORKLOAD_IDENTITY_PROVIDER = projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL}/providers/${WIF_PROVIDER}"
+# Dr. Wanik example: projects/598481111020/locations/global/workloadIdentityPools/gh-pool/providers/gh-provider
 ```
 
 | Variable | Description |
