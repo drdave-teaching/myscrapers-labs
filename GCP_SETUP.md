@@ -1,46 +1,33 @@
 # GCP + GitHub Actions Setup Guide
-## craigslist-scraper deployment -- drdww
+## myscrapers-labs deployment
 
 **Dr. Dave Wanik** -- Dept. Operations and Information Management -- University of Connecticut
 
-This documents the exact steps used to deploy the myscrapers pipeline to GCP.
+This documents the exact steps to deploy the myscrapers pipeline to GCP with CI/CD via GitHub Actions.
 Follow in order -- each step builds on the last.
 
 > Open [Cloud Shell](https://shell.cloud.google.com) and paste each block.
-> GCP account: dww05002.s26.bittbridge@gmail.com
-> Project: craigslist-scraper-499015
 
 ---
 
-## Quick Reference -- GitHub Repository Variables
+## Before You Start
 
-Set these at: **Settings → Secrets and variables → Actions → Variables tab**
-
-| Variable | Value |
-|---|---|
-| `PROJECT_ID` | `craigslist-scraper-499015` |
-| `REGION` | `us-central1` |
-| `BUCKET_NAME` | `craigslist-scraper-bucket` |
-| `RUNTIME_SA` | `cf-runtime@craigslist-scraper-499015.iam.gserviceaccount.com` |
-| `DEPLOYER_SA` | `cf-deployer@craigslist-scraper-499015.iam.gserviceaccount.com` |
-| `WORKLOAD_IDENTITY_PROVIDER` | `projects/598481111020/locations/global/workloadIdentityPools/gh-pool/providers/gh-provider` |
-| `FUNCTION_NAME` | `listing-scraper` |
-| `FUNCTION_DIR` | `cloud_function/scraper_cars` |
-| `BASE_SITE` | `https://newhaven.craigslist.org` |
-| `SEARCH_PATH` | `/search/cto` |
-| `USER_AGENT` | `Mozilla/5.0 (compatible; research-bot/1.0)` |
+You need:
+- A GCP account with billing enabled (free trial works)
+- A GitHub repo forked from `drdave-teaching/myscrapers-labs`
+- The repo's default branch must be **master** (not main)
 
 ---
 
-## Step 1 -- Variables (run this first)
+## Step 1 -- Variables (run this first, fill in YOUR values)
 
 ```bash
-PROJECT_ID="craigslist-scraper-499015"
-GITHUB_REPO="drdww/myscrapers-labs"
+PROJECT_ID="your-gcp-project-id"        # e.g. craigslist-scraper-499015
+GITHUB_REPO="your-github-org/myscrapers-labs"  # e.g. drdww/myscrapers-labs
 
-# --- auto-derived ---
+# --- auto-derived, do not edit below ---
 REGION="us-central1"
-BUCKET_NAME="craigslist-scraper-bucket"
+BUCKET_NAME="${PROJECT_ID}-bucket"
 RUNTIME_SA_ID="cf-runtime"
 DEPLOYER_SA_ID="cf-deployer"
 SCHED_SA_ID="cf-scheduler"
@@ -53,7 +40,6 @@ PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projec
 PRINCIPAL_SET="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL}/attribute.repository/${GITHUB_REPO}"
 SCHEDULER_AGENT="service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
 echo "Ready. Project: ${PROJECT_ID} (${PROJECT_NUMBER})"
-# Expected: Ready. Project: craigslist-scraper-499015 (598481111020)
 ```
 
 ---
@@ -122,7 +108,7 @@ gcloud iam service-accounts add-iam-policy-binding "${DEPLOYER_SA}" \
 echo "WIF done."
 ```
 
-> **Note:** attribute-condition uses `refs/heads/master` (not main) -- this repo's default branch is master.
+> **Important:** attribute-condition uses `refs/heads/master` -- if your repo default branch is different, change this.
 
 ---
 
@@ -211,9 +197,40 @@ echo "Vertex AI done."
 
 ---
 
-## Step 9 -- Deploy Workflows (in order)
+## Step 9 -- GitHub Repository Variables
 
-Go to **Actions** tab and trigger each workflow manually via **Run workflow**:
+Set these at: **Settings → Secrets and variables → Actions → Variables tab**
+
+Run this in Cloud Shell to print the exact values to paste:
+
+```bash
+echo "PROJECT_ID        = ${PROJECT_ID}"
+echo "REGION            = ${REGION}"
+echo "BUCKET_NAME       = ${BUCKET_NAME}"
+echo "RUNTIME_SA        = ${RUNTIME_SA}"
+echo "DEPLOYER_SA       = ${DEPLOYER_SA}"
+echo "WORKLOAD_IDENTITY_PROVIDER = projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL}/providers/${WIF_PROVIDER}"
+```
+
+| Variable | Description |
+|---|---|
+| `PROJECT_ID` | Your GCP project ID |
+| `REGION` | `us-central1` |
+| `BUCKET_NAME` | Your GCS bucket name |
+| `RUNTIME_SA` | Runtime service account email |
+| `DEPLOYER_SA` | Deployer service account email |
+| `WORKLOAD_IDENTITY_PROVIDER` | Full WIF provider resource name |
+| `FUNCTION_NAME` | `listing-scraper` |
+| `FUNCTION_DIR` | `cloud_function/scraper_cars` |
+| `BASE_SITE` | e.g. `https://newhaven.craigslist.org` |
+| `SEARCH_PATH` | `/search/cto` |
+| `USER_AGENT` | `Mozilla/5.0 (compatible; research-bot/1.0)` |
+
+---
+
+## Step 10 -- Deploy Workflows (in order)
+
+Go to **Actions** tab on GitHub and trigger each workflow manually via **Run workflow**:
 
 1. `deploy-extractor.yml`
 2. `deploy-materialize-master.yml`
@@ -221,16 +238,22 @@ Go to **Actions** tab and trigger each workflow manually via **Run workflow**:
 4. `deploy.yml` -- the scraper
 5. `deploy-extractor-llm.yml` -- Vertex AI / Gemini
 
-All should show green. If WIF fails, check that the attribute-condition branch matches your default branch.
+All should show green. If WIF fails, confirm the attribute-condition branch matches your repo's default branch.
 
 ---
 
-## Notes from First Deploy (June 2026)
+## Step 11 -- Upload Champion Models to GCS
 
-- WIF initially failed because template used `refs/heads/main` but repo default branch is `master` -- fixed in Step 4b above
-- `sync-data.yml` workflow was deleted -- it ran hourly, tried to push to `main` (wrong branch), caused noise
-- `materialize-master/main.py` updated to incremental append (only scans last 75 min) instead of full rescan
-- Free trial: $300 credit, used ~$65 in setup/first deploys, expires July 7 2026
+After deploy, upload your pre-trained champion models so train-dt can load them:
+
+```bash
+gsutil cp champion_regex.pkl gs://${BUCKET_NAME}/models/champion_regex.pkl
+gsutil cp champion_llm.pkl   gs://${BUCKET_NAME}/models/champion_llm.pkl
+gsutil cp champion_metrics.json gs://${BUCKET_NAME}/models/champion_metrics.json
+```
+
+> If you don't have .pkl files yet, run `train_champions.py --dry-run` locally first to generate them,
+> then upload. See `CarPricePipeline_ChampionModels.ipynb` for the full walkthrough.
 
 ---
 
@@ -253,10 +276,20 @@ GitHub Actions (OIDC / master branch)
         |-- extractor parses regex fields
         |-- extractor-llm calls Vertex AI (Gemini)
         |-- materialize-master appends to listings_master.csv
-        |-- train-dt trains decision tree on master CSV
+        |-- train-dt: champion vs challenger decision tree
         |
   Cloud Scheduler (hourly cron)
         |
         v
   Cloud Function HTTP endpoints
 ```
+
+## Champion vs Challenger
+
+`train-dt` runs on a schedule and:
+1. Loads `champion_regex.pkl` and `champion_llm.pkl` from GCS (your pre-trained baselines)
+2. Retrains fresh challengers on the latest `listings_master.csv`
+3. Scores all 4 models on today's holdout listings
+4. Writes `comparison.csv` to `gs://<bucket>/structured/preds/<YYYYMMDDHH>/`
+
+Check results anytime at: **Cloud Storage → structured/preds → latest folder → comparison.csv**
